@@ -1,0 +1,152 @@
+#!/bin/bash
+
+hash docker || exit 1
+
+GO_VERSION="1.13.4"
+DEBIAN_VERSION="buster"
+
+SERVICE_NAME="caddy"
+SERVICE_DESCRIPTION="Caddy HTTP/2 Server"
+SERVICE_MAINTAINER="<$(whoami)@$(hostname --fqdn)>"
+SERVICE_URL="https://github.com/mholt/caddy"
+SERVICE_LICENSE="Apache License 2.0"
+
+TEMP="$(mktemp -d)"
+
+trap "{ rm -rf ${TEMP}; }" EXIT
+
+mkdir -p "${TEMP}/package/usr/bin"
+mkdir -p "${TEMP}/package/etc/caddy"
+mkdir -p "${TEMP}/package/etc/caddy/ssl"
+mkdir -p "${TEMP}/package/var/www/public"
+
+cat > "${TEMP}/package/etc/caddy/Caddyfile" <<-EOF
+	0.0.0.0:8090 {
+	    root /var/www/public
+	    gzip
+	    tls off
+	    templates
+	}
+EOF
+
+cat > "${TEMP}/package/var/www/public/index.html" <<-EOF
+	<html>
+	    <head>
+	        <title>Caddy HTTP/2 Server</title>
+	        <style>
+	            body { font-family: monospace; }
+	            h1 { font-size: 32px; }
+	            p { font-size: 16px; }
+	        </style>
+	    </head>
+	    <body>
+	        <h1>Caddy HTTP/2 Server</h1>
+	        <p>{{.NowDate.Format "2006-01-02 15:04:05 MST"}}</p>
+	        <p>{{.IP}}</p>
+	    </body>
+	</html>
+EOF
+
+cat > "${TEMP}/caddy.go" <<-EOF
+	package main
+
+	import (
+	  "github.com/caddyserver/caddy/caddy/caddymain"
+	)
+
+	func main() {
+	  caddymain.EnableTelemetry = false
+	  caddymain.Run()
+	}
+EOF
+
+cat > "${TEMP}/after-install" <<-EOF
+	chown -R www-data:www-data /etc/caddy
+	chown -R www-data:www-data /var/www/public
+EOF
+
+cat > "${TEMP}/caddy.service" <<-EOF
+	[Unit]
+	Description=Caddy HTTP/2 Server
+	Documentation=https://caddyserver.com/docs
+	After=network-online.target
+	Wants=network-online.target systemd-networkd-wait-online.service
+
+	[Service]
+	Restart=on-abnormal
+
+	User=www-data
+	Group=www-data
+
+	Environment=CADDYPATH=/etc/caddy/ssl
+
+	ExecStart=/usr/bin/caddy -log stdout -agree=true -conf=/etc/caddy/Caddyfile -root=/var/tmp
+	ExecReload=/bin/kill -USR1 $MAINPID
+
+	KillMode=mixed
+	KillSignal=SIGQUIT
+	TimeoutStopSec=5s
+
+	LimitNOFILE=1048576
+	LimitNPROC=512
+
+	PrivateTmp=true
+	PrivateDevices=true
+	ProtectHome=true
+	ProtectSystem=full
+	ReadWriteDirectories=/etc/caddy/ssl
+
+	CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+	AmbientCapabilities=CAP_NET_BIND_SERVICE
+	NoNewPrivileges=true
+
+	[Install]
+	WantedBy=multi-user.target
+EOF
+
+cat > "${TEMP}/build" <<-EOF
+	#!/bin/sh
+
+	cd /mnt || exit 1
+
+	go mod init caddy
+	go get github.com/caddyserver/caddy
+	go build
+
+	/mnt/caddy -version | head -1 | awk "{ print \\\$2}" | tr -d "\t\n\r v" > /mnt/version
+
+	mv /mnt/caddy "/mnt/package/usr/bin/caddy"
+
+  DEBIAN_FRONTEND=noninteractive
+  export DEBIAN_FRONTEND
+
+	apt update
+	apt install -y build-essential ruby ruby-dev
+
+	gem install fpm
+
+	fpm --verbose \\
+	--name "${SERVICE_NAME}" \\
+	--description "${SERVICE_DESCRIPTION}" \\
+	--maintainer "${SERVICE_MAINTAINER}" \\
+	--url "${SERVICE_URL}" \\
+	--license "${SERVICE_LICENSE}" \\
+	--version "\$(cat /mnt/version)" \\
+	--chdir "/mnt/package" \\
+	--input-type dir \\
+	--output-type deb \\
+	--force \\
+	--after-install "/mnt/after-install" \\
+	--deb-systemd "/mnt/caddy.service" \\
+	.
+
+	chown "$(id -u "$(whoami)")":"$(id -g "$(whoami)")" "/mnt/caddy_\$(cat /mnt/version)_amd64.deb"
+
+	cd - > /dev/null || exit 1
+EOF
+
+chmod +x "${TEMP}/build"
+
+docker run --volume "${TEMP}":/mnt golang:"${GO_VERSION}-${DEBIAN_VERSION}" /mnt/build
+
+mv "${TEMP}/caddy_$(cat "${TEMP}/version")_amd64.deb" .

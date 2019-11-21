@@ -1,0 +1,95 @@
+#!/bin/bash
+
+hash docker || exit 1
+
+GO_VERSION="1.13.4"
+ALPINE_VERSION="3.10"
+
+TEMP="$(mktemp -d)"
+
+trap "{ rm -rf ${TEMP}; }" EXIT
+
+cat > "${TEMP}/Caddyfile" <<-EOF
+	0.0.0.0:80 {
+	    root /var/www/public
+	    gzip
+	    tls off
+	    templates
+	}
+EOF
+
+cat > "${TEMP}/index.html" <<-EOF
+	<html>
+	    <head>
+	        <title>Caddy HTTP/2 Server</title>
+	        <style>
+	            body { font-family: monospace; }
+	            h1 { font-size: 32px; }
+	            p { font-size: 16px; }
+	        </style>
+	    </head>
+	    <body>
+	        <h1>Caddy HTTP/2 Server</h1>
+	        <p>{{.NowDate.Format "2006-01-02 15:04:05 MST"}}</p>
+	        <p>{{.IP}}</p>
+	    </body>
+	</html>
+EOF
+
+cat > "${TEMP}/caddy.go" <<-EOF
+	package main
+
+	import (
+	  "github.com/caddyserver/caddy/caddy/caddymain"
+	)
+
+	func main() {
+	  caddymain.EnableTelemetry = false
+	  caddymain.Run()
+	}
+EOF
+
+cat > "${TEMP}/build" <<-EOF
+	#!/bin/sh
+
+	cd /mnt || exit 1
+
+	go mod init caddy
+	go get github.com/caddyserver/caddy
+	go build
+
+	/mnt/caddy -version | head -1 | awk "{ print \\\$2}" | tr -d "\t\n\r v" > /mnt/version
+
+	cd - > /dev/null || exit 1
+EOF
+
+chmod +x "${TEMP}/build"
+
+docker run --volume "${TEMP}":/mnt golang:"${GO_VERSION}-alpine${ALPINE_VERSION}" /mnt/build
+
+cat > "${TEMP}/Dockerfile" <<-EOF
+	FROM alpine:${ALPINE_VERSION}
+
+	ADD caddy /usr/bin/caddy
+	ADD index.html /var/www/public/index.html
+	ADD Caddyfile /caddy/Caddyfile
+
+	RUN apk update
+	RUN apk add ca-certificates
+	RUN apk add libcap
+
+	RUN setcap CAP_NET_BIND_SERVICE=+eip /usr/bin/caddy
+
+	RUN addgroup -S -g 1000 caddy
+	RUN adduser -S -u 1000 -G caddy -g caddy -h /caddy caddy
+	RUN chown -R caddy:caddy /var/www/public
+	RUN chown -R caddy:caddy /caddy
+
+	USER caddy
+	ENV CADDYPATH=/caddy/ssl
+	WORKDIR /tmp
+
+	ENTRYPOINT ["/usr/bin/caddy", "-agree", "-conf", "/caddy/Caddyfile", "-log", "/dev/stdout"]
+EOF
+
+docker build --no-cache --tag caddy:"$(cat "${TEMP}/version")" --tag caddy:latest "${TEMP}"
