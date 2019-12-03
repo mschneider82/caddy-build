@@ -67,6 +67,30 @@ chmod +x "${TEMP}/build"
 
 docker run --volume "${TEMP}":/mnt golang:"${GO_VERSION}-alpine${ALPINE_VERSION}" /mnt/build
 
+cat > "$TEMP/caddyfile.tmpl" <<-EOF
+	{{ getenv "LISTENADDR" "0.0.0.0"}}:{{ getenv "PORT" "443" }} {
+	    root /var/www/public
+	    gzip
+	    {{ getenv "PROXY" ""}}
+            proxy / {{ getenv "BACKENDS" }}  {
+		    {{ getenv "INSECURESKIPVERIFY" "insecure_skip_verify" }}
+		    policy round_robin
+		    {{ getenv "HEALTHCHECK" "" }}
+	    }
+
+	    tls {{ getenv "TLS" "self_signed" }}
+	    templates
+	}
+EOF
+cat > "$TEMP/caddyfile.toml" <<-EOF
+[template]
+src = "caddyfile.tmpl"
+dest = "/caddy/Caddyfile"
+owner = "root"
+mode = "0644"
+keys = ["/"]
+EOF
+
 cat > "${TEMP}/Dockerfile" <<-EOF
 	FROM alpine:${ALPINE_VERSION}
 
@@ -85,11 +109,31 @@ cat > "${TEMP}/Dockerfile" <<-EOF
 	RUN chown -R caddy:caddy /var/www/public
 	RUN chown -R caddy:caddy /caddy
 
-	USER caddy
 	ENV CADDYPATH=/caddy/ssl
 	WORKDIR /tmp
+	# Install extra package
+	RUN apk --update add fping curl bash &&\
+	    rm -rf /var/cache/apk/*
 
-	ENTRYPOINT ["/usr/bin/caddy", "-agree", "-conf", "/caddy/Caddyfile", "-log", "/dev/stdout"]
+	COPY caddyfile.tmpl /opt/confd/etc/templates/
+	COPY caddyfile.toml /opt/confd/etc/conf.d/
+
+	# Install confd
+	ENV CONFD_VERSION="0.16.0" \
+	    CONFD_HOME="/opt/confd"
+	RUN mkdir -p "/opt/confd/etc/conf.d" "/opt/confd/etc/templates" "/opt/confd/log" "/opt/confd/bin" &&\
+	    curl -Lo "/opt/confd/bin/confd" "https://github.com/kelseyhightower/confd/releases/download/v0.16.0/confd-0.16.0-linux-amd64" &&\
+	    chmod +x "/opt/confd/bin/confd"
+
+	USER caddy
+
+	CMD sh -c "/opt/confd/bin/confd -onetime -backend env -confdir /opt/confd/etc && /usr/bin/caddy -agree -conf /caddy/Caddyfile -log /dev/stdout"
 EOF
 
 docker build --no-cache --tag caddy:"$(cat "${TEMP}/version")" --tag caddy:latest "${TEMP}"
+
+
+docker tag caddy:latest mschneider82/caddy-tls-reverseproxy:"$(cat "${TEMP}/version")"
+docker tag caddy:latest mschneider82/caddy-tls-reverseproxy:latest
+docker push mschneider82/caddy-tls-reverseproxy:"$(cat "${TEMP}/version")"
+docker push mschneider82/caddy-tls-reverseproxy:latest
